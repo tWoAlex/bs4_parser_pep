@@ -19,7 +19,11 @@ def control_output(results, cli_args):
 
 
 def default_output(results):
-    print(*results, sep='\n')
+    print(
+        *[' '.join(map(str, item))
+          for item in results],
+        sep='\n'
+    )
 
 
 def pretty_output(results):
