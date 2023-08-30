@@ -1,5 +1,6 @@
 import re
 import logging
+from collections import Counter
 from urllib.parse import urljoin
 
 import requests_cache
@@ -41,6 +42,10 @@ def whats_new(session):
     return results
 
 
+LATEST_VERSION_REGEX = re.compile(
+    r'Python (?P<version>\d\.\d+) \((?P<status>.*)\)')
+
+
 def latest_versions(session):
     response = get_response(session, MAIN_DOC_URL)
     if not response:
@@ -58,10 +63,9 @@ def latest_versions(session):
         raise Exception('Ничего не нашлось')
 
     results = [('Ссылка на документацию', 'Версия', 'Статус')]
-    pattern = r'Python (?P<version>\d\.\d+) \((?P<status>.*)\)'
     for tag in tqdm(a_tags, desc='Версии', unit='верс.'):
         link = tag['href']
-        text_match = re.search(pattern, tag.text)
+        text_match = re.search(LATEST_VERSION_REGEX, tag.text)
         if text_match:
             version, status = text_match.groups()
         else:
@@ -93,65 +97,47 @@ def download(session):
 
 
 def pep(session):
-    def parse_section(soup: BeautifulSoup, header_tag) -> tuple[str, list]:
-        """Возвращает кортеж вида (Заголовок таблицы, список PEPов),
-        где каждый PEP из списка — кортеж вида
-        (номер, ссылка, тип и статус, название, авторы)."""
-        header = find_tag(soup, header_tag)
-        table_rows = find_tag(soup, 'tbody')
+    response = get_response(session, PEPS_URL)
+    if not response:
+        return
+    soup = BeautifulSoup(response.text, features='lxml')
 
-        peps = []
-        for row in table_rows.find_all('tr'):
-            type_n_status, number, title, authors = row.find_all('td')
-            href = urljoin(PEPS_URL, find_tag(row, 'a')['href'])
-            peps.append(
-                (int(number.text), href,
-                 type_n_status.text, title.text, authors.text)
-            )
-        return header.text, peps
+    numerical_index_soup = find_tag(soup, 'section',
+                                    attrs={'id': 'numerical-index'})
+    table_rows = find_tag(numerical_index_soup, 'tbody')
 
-    def status_from_pep_soup(soup: BeautifulSoup):
-        """Возвращает статус со страницы PEPа."""
-        table = find_tag(soup, 'dl',
+    peps = []
+    for row in table_rows.find_all('tr'):
+        type_n_status, number, title, authors = row.find_all('td')
+        href = urljoin(PEPS_URL, find_tag(row, 'a')['href'])
+        peps.append(
+            (int(number.text), href,
+             type_n_status.text, title.text, authors.text))
+
+    status_counters = Counter()
+    status_conflicts = []
+    for pep in tqdm(peps, leave=False, unit=' PEP',
+                    desc='Получение данных со страницы PEPa'):
+        url, type_n_status = pep[1], pep[2]
+
+        pep_page = get_response(session, url).text
+        pep_page = BeautifulSoup(pep_page, features='lxml')
+        table = find_tag(pep_page, 'dl',
                          attrs={'class': 'rfc2822 field-list simple'})
         lines = zip(table.find_all('dt'), table.find_all('dd'))
-
         pep_status = None
         for dt_tag, dd_tag in lines:
             if dt_tag.text == 'Status:':
                 pep_status = dd_tag.text
 
-        return pep_status
-
-    response = get_response(session, PEPS_URL)
-    if not response:
-        return
-
-    soup = BeautifulSoup(response.text, features='lxml')
-
-    numerical_index = find_tag(soup, 'section',
-                               attrs={'id': 'numerical-index'})
-    numerical_index = parse_section(numerical_index, 'h2')
-
-    pep_statuses = dict()
-    status_conflicts = []
-    for _, url, ts, _, _ in tqdm(numerical_index[1],
-                                 leave=False, unit=' PEP',
-                                 desc='Получение данных со страницы PEPa'):
-        pep_page = get_response(session, url).text
-        pep_page = BeautifulSoup(pep_page, features='lxml')
-
-        table_statuses = EXPECTED_STATUS[ts[1:]]
-        pep_status = status_from_pep_soup(pep_page)
-
+        table_statuses = EXPECTED_STATUS[type_n_status[1:]]
         if pep_status not in table_statuses:
             status_conflicts.append(
                 (f'{url}\nСтатус в карточке: {pep_status}'
                  f'\nОжидаемые статусы: {table_statuses}')
             )
 
-        pep_statuses[pep_status] = (pep_statuses[pep_status] + 1
-                                    if pep_status in pep_statuses else 1)
+        status_counters.update((pep_status,))
 
     if status_conflicts:
         logging.warning(
@@ -159,13 +145,12 @@ def pep(session):
             '\n'.join(status_conflicts)
         )
 
-    pep_statuses = sorted(pep_statuses.items())
-    pep_statuses = (
+    status_counters = (
         [('Статус', 'Количество')]
-        + pep_statuses +
-        [('Total', sum(map(lambda x: x[1], pep_statuses)))]
+        + sorted(list(status_counters.items())) +
+        [('Total', status_counters.total())]
     )
-    return pep_statuses
+    return status_counters
 
 
 MODE_TO_FUNCTION = {
